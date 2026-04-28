@@ -59,7 +59,7 @@ DEFAULT_COLORS = [
     (52, 73, 94), (127, 140, 141), (39, 174, 96), (41, 128, 185),
 ]
 
-ACTION_TYPE_NAMES = {0: "Ninguna", 1: "URL", 2: "Teclado", 3: "App", 4: "Texto"}
+ACTION_TYPE_NAMES = {0: "Ninguna", 1: "URL", 2: "Teclado", 3: "App", 4: "Texto", 5: "Comando"}
 
 KEYBOARD_GROUPS = [
     ("GNOME / Ubuntu", [
@@ -213,6 +213,63 @@ def img_to_rgb565_b64(path: Path, size: int, bg: tuple) -> str:
 
 def icon_cache_path(page: int, idx: int) -> Path:
     return ICON_CACHE / f"p{page}_b{idx}.png"
+
+
+# ─── Profile import/export ───
+PROFILE_VERSION = 1
+
+
+def export_profile(path: Path, pages: list[list[ButtonData]], page_names: list[str]):
+    """Serialise the full deck state to a JSON file (icons embedded as base64)."""
+    out: dict = {
+        "version": PROFILE_VERSION,
+        "page_names": list(page_names),
+        "pages": [],
+    }
+    for p in range(NUM_PAGES):
+        row = []
+        for i in range(NUM_BUTTONS):
+            btn = pages[p][i]
+            d = btn.to_dict()
+            d.pop("hasIcon", None)  # device-side flag, not part of profile
+            d["icon_b64"] = None
+            ic = icon_cache_path(p, i)
+            if ic.exists():
+                try:
+                    d["icon_b64"] = base64.b64encode(ic.read_bytes()).decode()
+                except OSError:
+                    pass
+            row.append(d)
+        out["pages"].append(row)
+    path.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_profile(path: Path) -> dict:
+    """Read and validate a profile file. Returns the parsed dict."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("version") != PROFILE_VERSION:
+        raise ValueError(f"versión de perfil no soportada (esperaba {PROFILE_VERSION})")
+    pages = data.get("pages")
+    if not isinstance(pages, list) or len(pages) < NUM_PAGES:
+        raise ValueError("el perfil no contiene todas las páginas")
+    for p in range(NUM_PAGES):
+        if not isinstance(pages[p], list) or len(pages[p]) < NUM_BUTTONS:
+            raise ValueError(f"página {p+1} incompleta")
+    return data
+
+
+def is_ctrl_pressed() -> bool:
+    """Query the current keyboard modifier state via Gdk."""
+    display = Gdk.Display.get_default()
+    if not display:
+        return False
+    seat = display.get_default_seat()
+    if not seat:
+        return False
+    kb = seat.get_keyboard()
+    if not kb:
+        return False
+    return bool(kb.get_modifier_state() & Gdk.ModifierType.CONTROL_MASK)
 
 
 # ─── Serial link ───
@@ -680,6 +737,19 @@ def execute_action(action_type: int, action: str):
         kb = get_kb()
         if kb.available:
             kb.type_text(action)
+    elif action_type == 5:
+        # Raw shell command. shell=True so users can pipe / chain.
+        try:
+            subprocess.Popen(
+                action,
+                shell=True,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            print(f"[command] failed: {e}", file=sys.stderr)
 
 
 # ─── Style manager ───
@@ -756,12 +826,12 @@ class StyleManager:
 class DeckButton(Gtk.Button):
     __gtype_name__ = "DeckButton"
 
-    def __init__(self, page: int, idx: int, on_click, on_swap, style_mgr: StyleManager):
+    def __init__(self, page: int, idx: int, ctrl, style_mgr: StyleManager):
         super().__init__()
         self.page = page
         self.idx = idx
         self._style = style_mgr
-        self._on_swap = on_swap
+        self._ctrl = ctrl
         self._color_class = f"deck-p{page}-i{idx}"
         self.add_css_class("deck-card")
         self.add_css_class(self._color_class)
@@ -786,22 +856,29 @@ class DeckButton(Gtk.Button):
         box.append(self.hint_widget)
         self.set_child(box)
 
-        self.connect("clicked", lambda *_: on_click(page, idx))
+        self.connect("clicked", lambda *_: ctrl.open_edit(page, idx))
 
         # Drag source: export "page:idx" so the drop target knows what to swap.
         drag_src = Gtk.DragSource()
-        drag_src.set_actions(Gdk.DragAction.MOVE)
+        drag_src.set_actions(Gdk.DragAction.MOVE | Gdk.DragAction.COPY)
         drag_src.connect("prepare", self._on_drag_prepare)
         drag_src.connect("drag-begin", self._on_drag_begin)
         drag_src.connect("drag-end", self._on_drag_end)
         self.add_controller(drag_src)
 
         # Drop target: accept "page:idx" strings from another DeckButton.
-        drop_target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+        drop_target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE | Gdk.DragAction.COPY)
         drop_target.connect("enter", self._on_drop_enter)
         drop_target.connect("leave", self._on_drop_leave)
         drop_target.connect("drop", self._on_drop)
         self.add_controller(drop_target)
+
+        # Right-click context menu
+        gesture = Gtk.GestureClick.new()
+        gesture.set_button(3)  # secondary mouse button
+        gesture.connect("pressed", self._on_right_click)
+        self.add_controller(gesture)
+        self._popover = None
 
         self.update(default_button(idx))
 
@@ -838,8 +915,55 @@ class DeckButton(Gtk.Button):
             return False
         if sp == self.page and si == self.idx:
             return False  # dropped on itself
-        self._on_swap(sp, si, self.page, self.idx)
+        if is_ctrl_pressed():
+            self._ctrl.copy_button(sp, si, self.page, self.idx)
+        else:
+            self._ctrl.swap_buttons(sp, si, self.page, self.idx)
         return True
+
+    def _on_right_click(self, gesture, n_press, x, y):
+        if self._popover and self._popover.is_visible():
+            self._popover.popdown()
+        popover = Gtk.Popover()
+        popover.set_parent(self)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y = int(x), int(y)
+        rect.width = rect.height = 1
+        popover.set_pointing_to(rect)
+        popover.set_has_arrow(False)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_top(4); box.set_margin_bottom(4)
+        box.set_margin_start(4); box.set_margin_end(4)
+
+        def mk(label: str, callback, css=None) -> Gtk.Button:
+            b = Gtk.Button.new_with_label(label)
+            b.add_css_class("flat")
+            if css:
+                b.add_css_class(css)
+            b.set_halign(Gtk.Align.FILL)
+            b.set_hexpand(True)
+            b.get_first_child().set_xalign(0.0) if b.get_first_child() else None
+            b.connect("clicked", lambda *_: (popover.popdown(), callback()))
+            return b
+
+        box.append(mk("Editar…", lambda: self._ctrl.open_edit(self.page, self.idx)))
+        box.append(mk("Limpiar", lambda: self._ctrl.clear_button(self.page, self.idx), css="destructive-action"))
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.set_margin_top(4); sep.set_margin_bottom(4)
+        box.append(sep)
+
+        page_names = get_page_names()
+        for tp in range(NUM_PAGES):
+            if tp == self.page:
+                continue
+            label = f"Mover a {page_names[tp]}"
+            box.append(mk(label, lambda tp=tp: self._ctrl.move_to_page(self.page, self.idx, tp)))
+
+        popover.set_child(box)
+        self._popover = popover
+        popover.popup()
 
     def update(self, data: ButtonData):
         self._style.set_color(self._color_class, data.r, data.g, data.b)
@@ -872,14 +996,28 @@ class DeckButton(Gtk.Button):
 
 # ─── Edit dialog ───
 class EditDialog(Adw.Window):
-    def __init__(self, parent_window, page: int, idx: int, data: ButtonData, on_save, on_clear):
+    def __init__(
+        self,
+        parent_window,
+        page: int,
+        idx: int,
+        data: ButtonData,
+        on_save,
+        on_clear,
+        on_preview=None,
+        on_restore=None,
+    ):
         super().__init__()
         self.page = page
         self.idx = idx
         self.data = data
         self.on_save = on_save
         self.on_clear = on_clear
+        self.on_preview = on_preview
+        self.on_restore = on_restore
         self.pending_icon_path: Path | None = None
+        self.saved = False
+        self.connect("close-request", self._on_close_request)
 
         self.set_title(f"Botón {idx + 1} — página {page + 1}")
         self.set_transient_for(parent_window)
@@ -1014,6 +1152,43 @@ class EditDialog(Adw.Window):
         self.set_content(toolbar)
 
         self._refresh_action()
+        self._wire_preview_signals()
+
+    def _wire_preview_signals(self):
+        """Hook every editable field so the underlying button card updates live."""
+        if not self.on_preview:
+            return
+        self.label_row.connect("changed", lambda *_: self._fire_preview())
+        self.action_row.connect("changed", lambda *_: self._fire_preview())
+        self.color_btn.connect("color-set", lambda *_: self._fire_preview())
+        self.type_row.connect("notify::selected", lambda *_: self._fire_preview())
+        self.size_row.connect("notify::selected", lambda *_: self._fire_preview())
+        self.border_row.connect("notify::selected", lambda *_: self._fire_preview())
+        self.show_label_row.connect("notify::active", lambda *_: self._fire_preview())
+
+    def _current_data(self) -> ButtonData:
+        rgba = self.color_btn.get_rgba()
+        return ButtonData(
+            label=self.label_row.get_text(),
+            r=int(round(rgba.red * 255)),
+            g=int(round(rgba.green * 255)),
+            b=int(round(rgba.blue * 255)),
+            action=self.action_row.get_text(),
+            actionType=int(self.type_row.get_selected()),
+            iconSizeIdx=int(self.size_row.get_selected()),
+            borderStyle=int(self.border_row.get_selected()),
+            showLabel=self.show_label_row.get_active(),
+        )
+
+    def _fire_preview(self):
+        if self.on_preview:
+            self.on_preview(self._current_data())
+
+    def _on_close_request(self, *_):
+        # If the user closes without saving, revert the preview changes.
+        if not self.saved and self.on_restore:
+            self.on_restore()
+        return False  # let GTK actually close the window
 
     def _refresh_action(self):
         t = self.type_row.get_selected()
@@ -1022,7 +1197,8 @@ class EditDialog(Adw.Window):
             1: "URL completa. Si guardas sin icono se intentará bajar el favicon.",
             2: "Atajo: ctrl+c, super+up, ctrl+alt+t, vol_up, play_pause…",
             3: "Protocolo de app: spotify:, discord:, slack:, file://…",
-            4: "Texto que se escribirá vía Bluetooth",
+            4: "Texto que se escribirá vía teclado virtual",
+            5: "Comando shell, ej: notify-send hola && pulseaudio-ctl mute",
         }
         self.action_help_row.set_subtitle(helps.get(t, ""))
 
@@ -1152,22 +1328,13 @@ class EditDialog(Adw.Window):
         return False
 
     def _on_clear(self, *_):
+        self.saved = True
         self.on_clear(self.page, self.idx)
         self.close()
 
     def _on_save(self, *_):
-        rgba = self.color_btn.get_rgba()
-        new = ButtonData(
-            label=self.label_row.get_text(),
-            r=int(round(rgba.red * 255)),
-            g=int(round(rgba.green * 255)),
-            b=int(round(rgba.blue * 255)),
-            action=self.action_row.get_text(),
-            actionType=self.type_row.get_selected(),
-            iconSizeIdx=self.size_row.get_selected(),
-            borderStyle=self.border_row.get_selected(),
-            showLabel=self.show_label_row.get_active(),
-        )
+        self.saved = True
+        new = self._current_data()
         self.on_save(self.page, self.idx, new, self.pending_icon_path)
         self.close()
 
@@ -1269,9 +1436,15 @@ class MainWindow(Adw.ApplicationWindow):
         # Menu
         menu = Gio.Menu()
         menu.append("Renombrar páginas…", "win.rename_pages")
-        menu.append("Forzar relectura del deck", "win.refresh")
-        menu.append("Acerca de", "win.about")
-        menu.append("Salir", "win.quit")
+        section_profile = Gio.Menu()
+        section_profile.append("Importar perfil…", "win.import_profile")
+        section_profile.append("Exportar perfil…", "win.export_profile")
+        menu.append_section(None, section_profile)
+        section_misc = Gio.Menu()
+        section_misc.append("Forzar relectura del deck", "win.refresh")
+        section_misc.append("Acerca de", "win.about")
+        section_misc.append("Salir", "win.quit")
+        menu.append_section(None, section_misc)
         menu_btn = Gtk.MenuButton()
         menu_btn.set_icon_name("open-menu-symbolic")
         menu_btn.set_menu_model(menu)
@@ -1289,7 +1462,7 @@ class MainWindow(Adw.ApplicationWindow):
             grid.set_vexpand(True)
             row_widgets = []
             for i in range(NUM_BUTTONS):
-                btn = DeckButton(p, i, self.ctrl.open_edit, self.ctrl.swap_buttons, self.style_mgr)
+                btn = DeckButton(p, i, self.ctrl, self.style_mgr)
                 grid.attach(btn, i % COLS, i // COLS, 1, 1)
                 row_widgets.append(btn)
             self.buttons_widgets.append(row_widgets)
@@ -1297,7 +1470,10 @@ class MainWindow(Adw.ApplicationWindow):
             page_obj.set_icon_name("view-grid-symbolic")
             self.page_view_objs.append(page_obj)
 
-        toolbar.set_content(self.view_stack)
+        # Wrap content in a toast overlay for ephemeral feedback
+        self.toast_overlay = Adw.ToastOverlay()
+        self.toast_overlay.set_child(self.view_stack)
+        toolbar.set_content(self.toast_overlay)
         self.set_content(toolbar)
 
         # Actions
@@ -1305,6 +1481,8 @@ class MainWindow(Adw.ApplicationWindow):
         for name, fn in [
             ("refresh", lambda *_: self.ctrl.request_full_config()),
             ("rename_pages", lambda *_: self._open_rename_dialog()),
+            ("import_profile", lambda *_: self._open_import_dialog()),
+            ("export_profile", lambda *_: self._open_export_dialog()),
             ("about", lambda *_: self._show_about()),
             ("quit", lambda *_: self.app.quit()),
         ]:
@@ -1378,6 +1556,76 @@ class MainWindow(Adw.ApplicationWindow):
         for p, name in enumerate(names):
             self.ctrl.serial.write(f"PNAME:{p}:{name}")
 
+    def toast(self, message: str, timeout: int = 3):
+        t = Adw.Toast.new(message)
+        t.set_timeout(timeout)
+        self.toast_overlay.add_toast(t)
+
+    def _open_export_dialog(self):
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Exportar perfil")
+        dialog.set_initial_name("streamdeck-profile.json")
+        ff = Gtk.FileFilter()
+        ff.set_name("JSON")
+        ff.add_pattern("*.json")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(ff)
+        dialog.set_filters(filters)
+        dialog.save(self, None, self._on_export_chosen)
+
+    def _on_export_chosen(self, dialog, result):
+        try:
+            f = dialog.save_finish(result)
+        except GLib.Error:
+            return
+        path = Path(f.get_path())
+        try:
+            export_profile(path, self.ctrl.pages, get_page_names())
+            self.toast(f"Perfil exportado a {path.name}")
+        except Exception as e:
+            self.toast(f"Error al exportar: {e}", timeout=6)
+            print(f"[export] {e}", file=sys.stderr)
+
+    def _open_import_dialog(self):
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Importar perfil")
+        ff = Gtk.FileFilter()
+        ff.set_name("JSON")
+        ff.add_pattern("*.json")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(ff)
+        dialog.set_filters(filters)
+        dialog.open(self, None, self._on_import_chosen)
+
+    def _on_import_chosen(self, dialog, result):
+        try:
+            f = dialog.open_finish(result)
+        except GLib.Error:
+            return
+        path = Path(f.get_path())
+        # Confirm before overwriting everything
+        confirm = Adw.AlertDialog.new(
+            "Importar este perfil?",
+            "Sustituirá los 36 botones, sus iconos y los nombres de las páginas. Esta acción no se puede deshacer."
+        )
+        confirm.add_response("cancel", "Cancelar")
+        confirm.add_response("import", "Importar")
+        confirm.set_response_appearance("import", Adw.ResponseAppearance.DESTRUCTIVE)
+        confirm.set_default_response("cancel")
+        confirm.connect("response", self._on_import_confirmed, path)
+        confirm.present(self)
+
+    def _on_import_confirmed(self, dialog, response, path):
+        if response != "import":
+            return
+        try:
+            data = load_profile(path)
+            self.ctrl.apply_profile(data)
+            self.toast(f"Perfil importado de {path.name}")
+        except Exception as e:
+            self.toast(f"Error al importar: {e}", timeout=6)
+            print(f"[import] {e}", file=sys.stderr)
+
 
 # ─── Controller ───
 class Controller:
@@ -1406,7 +1654,22 @@ class Controller:
     def open_edit(self, page: int, idx: int):
         if not self.window:
             return
-        d = EditDialog(self.window, page, idx, self.pages[page][idx], self._on_edit_save, self._on_edit_clear)
+        original = self.pages[page][idx]
+
+        def preview(data: ButtonData):
+            if self.window:
+                self.window.update_button(page, idx, data)
+
+        def restore():
+            preview(original)
+
+        d = EditDialog(
+            self.window, page, idx, original,
+            on_save=self._on_edit_save,
+            on_clear=self._on_edit_clear,
+            on_preview=preview,
+            on_restore=restore,
+        )
         d.present()
 
     def swap_buttons(self, p1: int, i1: int, p2: int, i2: int):
@@ -1462,6 +1725,104 @@ class Controller:
         if self.window:
             self.window.update_button(p1, i1, b)
             self.window.update_button(p2, i2, a)
+
+    def copy_button(self, p1: int, i1: int, p2: int, i2: int):
+        """Copy source button onto destination, replacing it."""
+        if not (0 <= p1 < NUM_PAGES and 0 <= i1 < NUM_BUTTONS and 0 <= p2 < NUM_PAGES and 0 <= i2 < NUM_BUTTONS):
+            return
+        if p1 == p2 and i1 == i2:
+            return
+        src = self.pages[p1][i1]
+        new = ButtonData(
+            label=src.label, r=src.r, g=src.g, b=src.b,
+            action=src.action, actionType=src.actionType,
+            iconSizeIdx=src.iconSizeIdx, borderStyle=src.borderStyle,
+            showLabel=src.showLabel, hasIcon=False,
+        )
+        self.pages[p2][i2] = new
+
+        src_ic = icon_cache_path(p1, i1)
+        dst_ic = icon_cache_path(p2, i2)
+        if src_ic.exists():
+            try:
+                shutil.copy(src_ic, dst_ic)
+            except OSError as e:
+                print(f"[copy] icon copy failed: {e}", file=sys.stderr)
+        elif dst_ic.exists():
+            try:
+                dst_ic.unlink()
+            except OSError:
+                pass
+
+        self.serial.write(
+            f"SET:{p2}:{i2}:{new.label}:{new.r},{new.g},{new.b}:"
+            f"{new.iconSizeIdx},{new.borderStyle},{1 if new.showLabel else 0}"
+        )
+        self.serial.write(f"ACT:{p2}:{i2}:{new.actionType}:{new.action}")
+        if dst_ic.exists():
+            self._send_icon(p2, i2, dst_ic, new)
+        else:
+            self.serial.write(f"NOICON:{p2}:{i2}")
+
+        if self.window:
+            self.window.update_button(p2, i2, new)
+
+    def clear_button(self, page: int, idx: int):
+        """Reset a button to its default empty state."""
+        self._on_edit_clear(page, idx)
+
+    def move_to_page(self, page: int, idx: int, target_page: int):
+        """Swap this button with the same slot on the target page."""
+        if 0 <= target_page < NUM_PAGES and target_page != page:
+            self.swap_buttons(page, idx, target_page, idx)
+
+    def apply_profile(self, data: dict):
+        """Replace the entire deck state from a parsed profile dict."""
+        page_names = data.get("page_names") or default_page_names()
+        if len(page_names) < NUM_PAGES:
+            page_names = (page_names + default_page_names())[:NUM_PAGES]
+        set_page_names(page_names)
+
+        for p in range(NUM_PAGES):
+            for i in range(NUM_BUTTONS):
+                src = data["pages"][p][i]
+                btn = ButtonData.from_dict(src)
+                btn.hasIcon = False  # device starts without; we re-send below
+                self.pages[p][i] = btn
+
+                ic_path = icon_cache_path(p, i)
+                ic_b64 = src.get("icon_b64")
+                if ic_b64:
+                    try:
+                        ic_path.write_bytes(base64.b64decode(ic_b64))
+                    except (OSError, ValueError) as e:
+                        print(f"[import] icon p{p} i{i}: {e}", file=sys.stderr)
+                else:
+                    if ic_path.exists():
+                        try:
+                            ic_path.unlink()
+                        except OSError:
+                            pass
+
+                self.serial.write(
+                    f"SET:{p}:{i}:{btn.label}:{btn.r},{btn.g},{btn.b}:"
+                    f"{btn.iconSizeIdx},{btn.borderStyle},{1 if btn.showLabel else 0}"
+                )
+                self.serial.write(f"ACT:{p}:{i}:{btn.actionType}:{btn.action}")
+                if ic_path.exists():
+                    self._send_icon(p, i, ic_path, btn)
+                else:
+                    self.serial.write(f"NOICON:{p}:{i}")
+
+        # Sync page names to the deck and to the GUI tabs
+        for p, name in enumerate(page_names):
+            self.serial.write(f"PNAME:{p}:{name}")
+        if self.window:
+            for p in range(NUM_PAGES):
+                for i in range(NUM_BUTTONS):
+                    self.window.update_button(p, i, self.pages[p][i])
+            for p, page_obj in enumerate(self.window.page_view_objs):
+                page_obj.set_title(page_names[p])
 
     def set_device_page(self, page: int):
         if 0 <= page < NUM_PAGES and page != self.current_page:
