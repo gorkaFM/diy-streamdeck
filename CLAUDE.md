@@ -1,10 +1,13 @@
-# DIY Stream Deck con ESP32-8048S043 — fork Linux
+# DIY Stream Deck — notas tecnicas
+
+> Para usuarios finales: ver **`README.md`** (instalacion, uso, troubleshooting).
+> Este archivo recoge detalles internos utiles para trabajar en el codigo.
 
 ## Que es
 
 Stream Deck casero con pantalla tactil 4.3", **3 paginas de 12 botones** (36 acciones totales) configurables desde una **app nativa Linux (GTK4)**. URLs, apps, atajos de teclado, texto. Iconos personalizados con favicon automatico.
 
-**Diferencias con el repo upstream** (`sintex85/diy-streamdeck`): ese estaba pensado para Mac/Windows con Chrome + Web Serial; aqui todo el flujo va a USB con un teclado virtual (uinput) y una GUI Linux que vive en bandeja.
+**Diferencias con el repo upstream** (`sintex85/diy-streamdeck`): ese estaba pensado para Mac/Windows con Chrome + Web Serial; aqui todo el flujo va a USB con un teclado virtual (uinput) y una GUI Linux.
 
 ## Hardware
 
@@ -50,11 +53,14 @@ Despues:
 
 ## Flashear el firmware
 
-El firmware esta en `firmware/` precompilado. Para flashear con `esptool` (no el binario macOS antiguo):
-
 ```bash
 pip install --user esptool
+./firmware/flashear_linux.sh /dev/ttyUSB0
+```
 
+El script invoca `esptool` (instalado via pip) con los binarios de `firmware/`. Si necesitas el comando en crudo:
+
+```bash
 esptool --chip esp32s3 --port /dev/ttyUSB0 --baud 460800 \
   write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
   0x0000  firmware/button_counter.ino.bootloader.bin \
@@ -133,8 +139,8 @@ Cambio v2: todos los comandos llevan ahora un campo `page` (0..2). Sin compatibi
 ## Estructura
 
 ```
+README.md               -> Doc de usuario completa
 button_counter/         -> Codigo fuente Arduino (3 paginas, swipe)
-firmware/               -> Binarios precompilados + esptool antiguo (no usar)
+firmware/               -> Binarios precompilados + flashear_linux.sh
 linux/                  -> App nativa Linux + scripts de install/uninstall
-docs/index.html         -> Web vieja del upstream (DEPRECATED, protocolo viejo)
 ```
