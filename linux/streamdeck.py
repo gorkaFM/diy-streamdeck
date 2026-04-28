@@ -388,6 +388,7 @@ class KeyboardInjector:
     def __init__(self):
         self.ui = None
         self.error = None
+        self._lock = threading.Lock()
         if not HAS_EVDEV:
             self.error = "python3-evdev no instalado"
             return
@@ -403,12 +404,43 @@ class KeyboardInjector:
         try:
             keys = set(self.KEY_MAP.values())
             keys.update(self.UNSHIFTED_SYMBOLS.values())
+            # Include both LEFT and RIGHT modifiers so we can release
+            # any stuck state from a previous run/process.
+            keys.update([
+                ec.KEY_LEFTCTRL, ec.KEY_RIGHTCTRL,
+                ec.KEY_LEFTSHIFT, ec.KEY_RIGHTSHIFT,
+                ec.KEY_LEFTALT, ec.KEY_RIGHTALT,
+                ec.KEY_LEFTMETA, ec.KEY_RIGHTMETA,
+            ])
             cap = {ec.EV_KEY: list(keys)}
             self.ui = UInput(cap, name="DIY-StreamDeck-Virtual-KB", version=0x1)
+            self._release_all_modifiers()
+            # Give the compositor time to enumerate the new device before sending events.
+            time.sleep(0.4)
         except PermissionError as e:
             self.error = f"sin permiso para /dev/uinput ({e}); añade tu usuario al grupo input"
         except Exception as e:
             self.error = f"uinput init falló: {e}"
+
+    def _release_all_modifiers(self):
+        """Release every modifier key. Defensive: clears any stuck state from
+        a previous crash or a key event that wasn't paired with a release."""
+        if not self.ui:
+            return
+        for code in (
+            ec.KEY_LEFTCTRL, ec.KEY_RIGHTCTRL,
+            ec.KEY_LEFTSHIFT, ec.KEY_RIGHTSHIFT,
+            ec.KEY_LEFTALT, ec.KEY_RIGHTALT,
+            ec.KEY_LEFTMETA, ec.KEY_RIGHTMETA,
+        ):
+            try:
+                self.ui.write(ec.EV_KEY, code, 0)
+            except Exception:
+                pass
+        try:
+            self.ui.syn()
+        except Exception:
+            pass
 
     @property
     def available(self) -> bool:
@@ -422,6 +454,7 @@ class KeyboardInjector:
             return False
         # Single-token (media key, F-key, plain letter)
         if "+" not in s and s in self.KEY_MAP:
+            print(f"[combo] '{combo}' -> [{self.KEY_MAP[s]}]", file=sys.stderr)
             self._press_release([self.KEY_MAP[s]])
             return True
         parts = [p.strip() for p in s.split("+") if p.strip()]
@@ -434,25 +467,36 @@ class KeyboardInjector:
             else:
                 print(f"[combo] desconocido: '{p}' en '{combo}'", file=sys.stderr)
                 return False
+        print(f"[combo] '{combo}' -> {codes}", file=sys.stderr)
         self._press_release(codes)
         return True
 
     def type_text(self, text: str) -> bool:
         if not self.ui:
             return False
+        # Make sure no modifier is stuck before we start typing.
+        with self._lock:
+            self._release_all_modifiers()
+            time.sleep(0.01)
         for ch in text:
             self._type_char(ch)
-            time.sleep(0.005)
+            time.sleep(0.008)
         return True
 
     def _press_release(self, codes):
-        for c in codes:
-            self.ui.write(ec.EV_KEY, c, 1)
-        self.ui.syn()
-        time.sleep(0.02)
-        for c in reversed(codes):
-            self.ui.write(ec.EV_KEY, c, 0)
-        self.ui.syn()
+        # Press keys in order with a tiny delay between each. Many apps want
+        # the modifier(s) to land before the trigger key, otherwise the
+        # combo can be misinterpreted. Hold for ~30 ms before releasing.
+        with self._lock:
+            for c in codes:
+                self.ui.write(ec.EV_KEY, c, 1)
+                self.ui.syn()
+                time.sleep(0.012)
+            time.sleep(0.030)
+            for c in reversed(codes):
+                self.ui.write(ec.EV_KEY, c, 0)
+                self.ui.syn()
+                time.sleep(0.012)
 
     def _type_char(self, ch: str):
         if ch == " ":
@@ -1302,6 +1346,7 @@ class Controller:
                     action = parts[4]
                 except ValueError:
                     return
+                print(f"[btn] p={page} idx={idx} type={typ} action={action!r}", file=sys.stderr)
                 # Special: gear sends BTN:0:99:1:URL
                 if idx == 99:
                     execute_action(typ, action)

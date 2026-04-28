@@ -49,6 +49,8 @@ int activeSidebar = -1;
 bool locked = false;
 bool infoShown = false;
 uint8_t brightness = 255;
+uint32_t lastHostMs = 0;  // millis() of last serial command from host
+const uint32_t HOST_TIMEOUT_MS = 30000;
 
 // Touch state
 enum TouchPhase { TP_IDLE, TP_PRESS, TP_SWIPE };
@@ -158,15 +160,20 @@ void executeAction(int idx){
   // Always notify host (with page) so the desktop app can open URL/app
   Serial.printf("BTN:%d:%d:%d:%s\n", p, idx, buttons[p][idx].actionType, buttons[p][idx].action);
 
+  // If the host (Linux app) is connected via serial it injects keys via uinput;
+  // we must NOT also fire BLE or the user gets double events. BLE is only
+  // a fallback when the host has been quiet for HOST_TIMEOUT_MS.
+  bool hostActive = lastHostMs != 0 && (millis() - lastHostMs) < HOST_TIMEOUT_MS;
+
   switch(buttons[p][idx].actionType) {
     case 1: // URL - handled by host
     case 3: // App - handled by host
       break;
     case 2: // Keyboard shortcut
-      sendKeyCombo(buttons[p][idx].action);
+      if(!hostActive) sendKeyCombo(buttons[p][idx].action);
       break;
     case 4: // Text
-      if(bleKb.isConnected()) bleKb.print(buttons[p][idx].action);
+      if(!hostActive && bleKb.isConnected()) bleKb.print(buttons[p][idx].action);
       break;
   }
 }
@@ -443,7 +450,7 @@ void processCmd(){
 void handleSerial(){
   while(Serial.available()){
     char c=Serial.read();
-    if(c=='\n'){processCmd();sLen=0;}
+    if(c=='\n'){lastHostMs=millis();processCmd();sLen=0;}
     else if(c!='\r'&&sLen<(int)sizeof(sBuf)-1){sBuf[sLen++]=c;}
   }
 }
