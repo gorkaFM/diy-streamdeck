@@ -42,6 +42,7 @@ Button buttons[NUM_PAGES][NUM_BUTTONS];
 uint16_t* iconData[NUM_PAGES][NUM_BUTTONS];
 bool hasIcon[NUM_PAGES][NUM_BUTTONS];
 int iconPixelSize[NUM_PAGES][NUM_BUTTONS];
+char pageNames[NUM_PAGES][24];
 int currentPage = 0;
 int activeButton = -1;
 int activeSidebar = -1;
@@ -87,6 +88,14 @@ void saveOne(int p, int i){
 
 void saveBrightness(){prefs.begin("deck",false);prefs.putUChar("bri",brightness);prefs.end();}
 
+void savePageName(int p){
+  if(p<0||p>=NUM_PAGES)return;
+  prefs.begin("deck",false);
+  char k[8];snprintf(k,8,"pn%d",p);
+  prefs.putString(k,pageNames[p]);
+  prefs.end();
+}
+
 void loadConfig(){
   prefs.begin("deck",true);
   for(int p=0;p<NUM_PAGES;p++){
@@ -104,6 +113,13 @@ void loadConfig(){
     }
   }
   brightness=prefs.getUChar("bri",255);
+  for(int p=0;p<NUM_PAGES;p++){
+    char k[8];snprintf(k,8,"pn%d",p);
+    char defname[24];snprintf(defname,24,"Pagina %d",p+1);
+    String n=prefs.getString(k,defname);
+    strncpy(pageNames[p],n.c_str(),23);
+    pageNames[p][23]='\0';
+  }
   prefs.end();
 }
 
@@ -179,16 +195,21 @@ void drawSidebar(){
   lcd.setTextColor(lblCol);lcd.drawString(conn?"BT OK":"BT...",cx,y+42);
   y+=SB_ITEM_H;lcd.drawFastHLine(SB_X+8,y,SIDEBAR_W-16,lcd.color565(40,40,50));
 
-  // 1: Page nav (left half ◀, right half ▶) + page indicator
-  drawArrow(SB_X+10,y+22,false,lcd.color565(180,180,200));
-  drawArrow(SB_X+SIDEBAR_W-10,y+22,true,lcd.color565(180,180,200));
+  // 1: Page nav. Top row: arrows + "N/3". Middle: name (8 chars). Bottom: dots.
+  drawArrow(SB_X+10,y+12,false,lcd.color565(180,180,200));
+  drawArrow(SB_X+SIDEBAR_W-10,y+12,true,lcd.color565(180,180,200));
   char pbuf[8];snprintf(pbuf,8,"%d/%d",currentPage+1,NUM_PAGES);
-  lcd.setTextColor(lcd.color565(220,220,230));lcd.drawString(pbuf,cx,y+22);
+  lcd.setTextColor(lcd.color565(220,220,230));lcd.drawString(pbuf,cx,y+12);
+  // Page name (truncated)
+  char nbuf[10];
+  strncpy(nbuf,pageNames[currentPage],9);nbuf[9]='\0';
+  lcd.setTextColor(lcd.color565(255,220,120));
+  lcd.drawString(nbuf,cx,y+34);
   // 3 dots indicator
   for(int i=0;i<NUM_PAGES;i++){
     int dx=cx-((NUM_PAGES-1)*5)+i*10;
     uint16_t dc=(i==currentPage)?lcd.color565(100,180,255):lcd.color565(60,60,80);
-    lcd.fillCircle(dx,y+44,2,dc);
+    lcd.fillCircle(dx,y+50,2,dc);
   }
   y+=SB_ITEM_H;lcd.drawFastHLine(SB_X+8,y,SIDEBAR_W-16,lcd.color565(40,40,50));
 
@@ -305,6 +326,8 @@ void processCmd(){
   Serial.printf("[CMD] %.*s (%d)\n",min(sLen,40),sBuf,sLen);
 
   if(sLen==6&&memcmp(sBuf,"GETALL",6)==0){
+    for(int p=0;p<NUM_PAGES;p++)
+      Serial.printf("PNAME:%d:%s\n",p,pageNames[p]);
     for(int p=0;p<NUM_PAGES;p++){
       for(int i=0;i<NUM_BUTTONS;i++){
         Serial.printf("CFG:%d:%d:%s:%d,%d,%d:%d:%d,%d,%d:%d:%s\n",
@@ -317,6 +340,18 @@ void processCmd(){
     }
     Serial.printf("CURPAGE:%d\n",currentPage);
     Serial.println("END");return;
+  }
+
+  // PNAME:<page>:<text>  set page name (max 23 chars)
+  if(sLen>=6&&memcmp(sBuf,"PNAME:",6)==0){
+    int p1=sFindCh(':',6);if(p1<0)return;
+    int page=sToInt(6,p1);if(page<0||page>=NUM_PAGES)return;
+    int nl=min(sLen-p1-1,23);
+    memcpy(pageNames[page],sBuf+p1+1,nl);
+    pageNames[page][nl]='\0';
+    savePageName(page);
+    if(page==currentPage&&!infoShown)drawSidebar();
+    Serial.println("OK");return;
   }
 
   // SET:<page>:<idx>:<label>:<r>,<g>,<b>:<sz>,<brd>,<lbl>
