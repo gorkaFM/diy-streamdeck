@@ -24,11 +24,6 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Gio, GObject, Adw  # noqa: E402
 
-# AyatanaAppIndicator3 pulls GTK3, which conflicts with our GTK4 in-process.
-# Disabled by default; the tray runs as a separate subprocess if requested.
-HAS_TRAY = False
-AppIndicator = None
-
 import serial  # noqa: E402
 from PIL import Image  # noqa: E402
 
@@ -500,6 +495,88 @@ class KeyboardInjector:
             except Exception:
                 pass
             self.ui = None
+
+
+# ─── Tray subprocess (runs streamdeck-tray.py in GTK3) ───
+class TraySubprocess:
+    """Spawns the GTK3 tray icon as a child process. Communicates via JSON-line stdin/stdout."""
+
+    def __init__(self, on_show, on_quit, icon_path: Path):
+        self.on_show = on_show
+        self.on_quit = on_quit
+        self.proc = None
+        script = RESOURCE_DIR / "streamdeck-tray.py"
+        if not script.exists():
+            print(f"[tray] script no encontrado en {script}", file=sys.stderr)
+            return
+        try:
+            self.proc = subprocess.Popen(
+                [sys.executable, str(script), str(icon_path)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as e:
+            print(f"[tray] no se pudo arrancar: {e}", file=sys.stderr)
+            self.proc = None
+            return
+        threading.Thread(target=self._stdout_loop, daemon=True, name="tray-stdout").start()
+        threading.Thread(target=self._stderr_loop, daemon=True, name="tray-stderr").start()
+        print(f"[tray] subprocess iniciado (pid={self.proc.pid})", file=sys.stderr)
+
+    @property
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def update_status(self, connected: bool, port: str | None):
+        if not self.alive:
+            return
+        try:
+            payload = json.dumps({"type": "status", "connected": connected, "port": port})
+            self.proc.stdin.write(payload + "\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self.proc = None
+
+    def stop(self):
+        if not self.proc:
+            return
+        try:
+            self.proc.stdin.write(json.dumps({"type": "quit"}) + "\n")
+            self.proc.stdin.flush()
+            self.proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        self.proc = None
+
+    def _stdout_loop(self):
+        assert self.proc is not None
+        for raw in self.proc.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = msg.get("type")
+            if t == "show":
+                GLib.idle_add(self.on_show)
+            elif t == "quit":
+                GLib.idle_add(self.on_quit)
+
+    def _stderr_loop(self):
+        assert self.proc is not None
+        for raw in self.proc.stderr:
+            line = raw.rstrip()
+            if line:
+                print(f"[tray-stderr] {line}", file=sys.stderr)
 
 
 _kb_injector: KeyboardInjector | None = None
@@ -1176,48 +1253,8 @@ class MainWindow(Adw.ApplicationWindow):
         set_page_names(names)
         for p, page_obj in enumerate(self.page_view_objs):
             page_obj.set_title(names[p])
-
-
-# ─── Tray icon ───
-class TrayIcon:
-    def __init__(self, on_show, on_quit, get_status):
-        if not HAS_TRAY:
-            self.indicator = None
-            return
-        icon = str(ICON_PATH) if ICON_PATH.exists() else "input-keyboard"
-        self.indicator = AppIndicator.Indicator.new(
-            "diy-streamdeck",
-            icon,
-            AppIndicator.IndicatorCategory.APPLICATION_STATUS,
-        )
-        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
-        self.indicator.set_title("Stream Deck")
-        menu = Gtk.Menu()
-
-        self.status_item = Gtk.MenuItem(label="…")
-        self.status_item.set_sensitive(False)
-        menu.append(self.status_item)
-        menu.append(Gtk.SeparatorMenuItem())
-
-        show_item = Gtk.MenuItem(label="Mostrar ventana")
-        show_item.connect("activate", lambda *_: on_show())
-        menu.append(show_item)
-
-        quit_item = Gtk.MenuItem(label="Salir")
-        quit_item.connect("activate", lambda *_: on_quit())
-        menu.append(quit_item)
-
-        menu.show_all()
-        self.indicator.set_menu(menu)
-        self._get_status = get_status
-        GLib.timeout_add_seconds(2, self._refresh_status)
-
-    def _refresh_status(self):
-        if not self.indicator:
-            return False
-        connected, port = self._get_status()
-        self.status_item.set_label(f"Conectado: {port}" if connected else "Desconectado")
-        return True
+        for p, name in enumerate(names):
+            self.ctrl.serial.write(f"PNAME:{p}:{name}")
 
 
 # ─── Controller ───
@@ -1276,6 +1313,9 @@ class Controller:
                     execute_action(typ, action)
         elif line.startswith("CFG:"):
             self._parse_cfg(line)
+        elif line.startswith("PNAME:"):
+            # Device-side page name (informational only; GUI is source of truth).
+            pass
         elif line.startswith("CURPAGE:"):
             try:
                 p = int(line[len("CURPAGE:") :])
@@ -1329,14 +1369,23 @@ class Controller:
     def _on_connect_change(self, connected: bool, port: str | None):
         if self.window:
             self.window.set_status(connected, port)
+        if self.app.tray:
+            self.app.tray.update_status(connected, port)
         if connected:
             # Slight delay to let firmware start up
             GLib.timeout_add(600, self._on_post_connect)
 
     def _on_post_connect(self):
         self.request_full_config()
+        # Push our local page names to the deck so its sidebar shows them
+        GLib.timeout_add(800, self._push_page_names)
         # Re-send any cached icons after a brief delay
         GLib.timeout_add(1500, self._resend_cached_icons)
+        return False
+
+    def _push_page_names(self):
+        for p, name in enumerate(get_page_names()):
+            self.serial.write(f"PNAME:{p}:{name}")
         return False
 
     def _resend_cached_icons(self):
@@ -1467,10 +1516,13 @@ class StreamDeckApp(Adw.Application):
     def __init__(self, minimized: bool):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
         self.minimized = minimized
-        self.has_tray = HAS_TRAY
         self.controller: Controller | None = None
         self.window: MainWindow | None = None
-        self.tray = None
+        self.tray: TraySubprocess | None = None
+
+    @property
+    def has_tray(self) -> bool:
+        return self.tray is not None and self.tray.alive
 
     def do_activate(self):
         if self.window:
@@ -1481,19 +1533,22 @@ class StreamDeckApp(Adw.Application):
         self.controller.window = self.window
         self.controller.serial.start()
 
-        # Tray
-        if HAS_TRAY:
-            self.tray = TrayIcon(
-                on_show=lambda: self.window.present(),
-                on_quit=lambda: self.quit(),
-                get_status=self.controller.status,
-            )
-            self.controller.tray = self.tray
+        # Tray icon (subprocess so we don't drag GTK3 into our GTK4 process)
+        icon = ICON_PATH if ICON_PATH.exists() else Path(APP_ID)
+        self.tray = TraySubprocess(
+            on_show=lambda: self.window.present(),
+            on_quit=lambda: self.quit(),
+            icon_path=icon,
+        )
+        if not self.tray.alive:
+            self.tray = None
 
         if not self.minimized:
             self.window.present()
 
     def do_shutdown(self):
+        if self.tray:
+            self.tray.stop()
         if self.controller:
             self.controller.serial.stop()
         if _kb_injector:

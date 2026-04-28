@@ -13,9 +13,10 @@ AUTOSTART="$HOME/.config/autostart"
 mkdir -p "$BIN" "$SHARE" "$APPS" "$ICONS" "$AUTOSTART"
 
 echo "→ copiando archivos a $SHARE/"
-cp "$DIR/streamdeck.py" "$SHARE/streamdeck.py"
-cp "$DIR/icon.svg"      "$SHARE/icon.svg"
-chmod +x "$SHARE/streamdeck.py"
+cp "$DIR/streamdeck.py"       "$SHARE/streamdeck.py"
+cp "$DIR/streamdeck-tray.py"  "$SHARE/streamdeck-tray.py"
+cp "$DIR/icon.svg"            "$SHARE/icon.svg"
+chmod +x "$SHARE/streamdeck.py" "$SHARE/streamdeck-tray.py"
 
 echo "→ instalando icono en $ICONS/$APP_ID.svg"
 cp "$DIR/icon.svg" "$ICONS/$APP_ID.svg"
