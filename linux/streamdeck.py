@@ -372,6 +372,24 @@ class KeyboardInjector:
             m[str(d)] = getattr(ec, f"KEY_{d}")
         for i in range(1, 13):
             m[f"f{i}"] = getattr(ec, f"KEY_F{i}")
+        # Keypad keys (often used by power users / x11 atajos)
+        for d in range(10):
+            m[f"kp_{d}"] = getattr(ec, f"KEY_KP{d}", None) or getattr(ec, f"KEY_KP_{d}", 0)
+        m.update({
+            "kp_dot": ec.KEY_KPDOT,
+            "kp_delete": ec.KEY_KPDOT,   # numpad "." with NumLock off acts as delete
+            "kp_enter": ec.KEY_KPENTER,
+            "kp_plus": ec.KEY_KPPLUS,
+            "kp_minus": ec.KEY_KPMINUS,
+            "kp_star": ec.KEY_KPASTERISK,
+            "kp_slash": ec.KEY_KPSLASH,
+            "menu": ec.KEY_MENU,
+            "compose": ec.KEY_COMPOSE,
+            "capslock": ec.KEY_CAPSLOCK,
+            "numlock": ec.KEY_NUMLOCK,
+            "scrolllock": ec.KEY_SCROLLLOCK,
+            "pause": ec.KEY_PAUSE,
+        })
         return m
 
     KEY_MAP = None  # filled in __init__ once HAS_EVDEV is verified
