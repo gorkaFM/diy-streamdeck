@@ -41,6 +41,7 @@ except ImportError:
     ec = None
 
 # ─── Constants ───
+APP_ID = "com.bitsytornillos.streamdeck"
 NUM_PAGES = 3
 NUM_BUTTONS = 12
 COLS, ROWS = 4, 3
@@ -156,6 +157,44 @@ class ButtonData:
 def default_button(idx: int) -> ButtonData:
     r, g, b = DEFAULT_COLORS[idx % 12]
     return ButtonData(label=str(idx + 1), r=r, g=g, b=b)
+
+
+# ─── User settings ───
+def default_page_names() -> list[str]:
+    return [f"Página {i + 1}" for i in range(NUM_PAGES)]
+
+
+def load_settings() -> dict:
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(data: dict):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"settings save failed: {e}", file=sys.stderr)
+
+
+def get_page_names() -> list[str]:
+    s = load_settings()
+    names = s.get("page_names")
+    if isinstance(names, list) and len(names) == NUM_PAGES and all(isinstance(n, str) for n in names):
+        return [n.strip() or f"Página {i+1}" for i, n in enumerate(names)]
+    return default_page_names()
+
+
+def set_page_names(names: list[str]):
+    s = load_settings()
+    s["page_names"] = [n.strip()[:32] or f"Página {i+1}" for i, n in enumerate(names)]
+    save_settings(s)
 
 
 # ─── Icon helpers ───
@@ -934,6 +973,66 @@ class EditDialog(Adw.Window):
         self.close()
 
 
+# ─── Rename pages dialog ───
+class RenamePagesDialog(Adw.Window):
+    def __init__(self, parent_window, current_names: list[str], on_apply):
+        super().__init__()
+        self.set_title("Renombrar páginas")
+        self.set_transient_for(parent_window)
+        self.set_modal(True)
+        self.set_default_size(420, 320)
+        self.set_size_request(360, 280)
+        self.on_apply = on_apply
+
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar())
+
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(
+            title="Nombres de las páginas",
+            description="Aparecen en las pestañas de la app. Máximo 32 caracteres.",
+        )
+        page.add(group)
+
+        self.entries: list[Adw.EntryRow] = []
+        for i, name in enumerate(current_names):
+            row = Adw.EntryRow(title=f"Página {i + 1}")
+            row.set_text(name)
+            group.add(row)
+            self.entries.append(row)
+
+        toolbar.set_content(page)
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        actions.set_margin_top(12)
+        actions.set_margin_bottom(12)
+        actions.set_margin_start(12)
+        actions.set_margin_end(12)
+        actions.set_homogeneous(True)
+        cancel = Gtk.Button.new_with_label("Cancelar")
+        cancel.connect("clicked", lambda *_: self.close())
+        reset = Gtk.Button.new_with_label("Por defecto")
+        reset.connect("clicked", self._on_reset)
+        save = Gtk.Button.new_with_label("Guardar")
+        save.add_css_class("suggested-action")
+        save.connect("clicked", self._on_save)
+        actions.append(cancel)
+        actions.append(reset)
+        actions.append(save)
+        toolbar.add_bottom_bar(actions)
+
+        self.set_content(toolbar)
+
+    def _on_reset(self, *_):
+        for i, row in enumerate(self.entries):
+            row.set_text(f"Página {i + 1}")
+
+    def _on_save(self, *_):
+        names = [row.get_text() for row in self.entries]
+        self.on_apply(names)
+        self.close()
+
+
 # ─── Main window ───
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app, controller):
@@ -970,8 +1069,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Menu
         menu = Gio.Menu()
+        menu.append("Renombrar páginas…", "win.rename_pages")
         menu.append("Forzar relectura del deck", "win.refresh")
-        menu.append("Hacer captura del deck en pantalla", "win.screenshot_deck")
         menu.append("Acerca de", "win.about")
         menu.append("Salir", "win.quit")
         menu_btn = Gtk.MenuButton()
@@ -980,6 +1079,8 @@ class MainWindow(Adw.ApplicationWindow):
         header.pack_end(menu_btn)
 
         # Pages (3 grids)
+        self.page_view_objs: list = []
+        page_names = get_page_names()
         for p in range(NUM_PAGES):
             grid = Gtk.Grid()
             grid.set_row_spacing(10)
@@ -993,8 +1094,9 @@ class MainWindow(Adw.ApplicationWindow):
                 grid.attach(btn, i % COLS, i // COLS, 1, 1)
                 row_widgets.append(btn)
             self.buttons_widgets.append(row_widgets)
-            page_obj = self.view_stack.add_titled(grid, f"page{p}", f"Página {p+1}")
+            page_obj = self.view_stack.add_titled(grid, f"page{p}", page_names[p])
             page_obj.set_icon_name("view-grid-symbolic")
+            self.page_view_objs.append(page_obj)
 
         toolbar.set_content(self.view_stack)
         self.set_content(toolbar)
@@ -1003,7 +1105,7 @@ class MainWindow(Adw.ApplicationWindow):
         ag = Gio.SimpleActionGroup()
         for name, fn in [
             ("refresh", lambda *_: self.ctrl.request_full_config()),
-            ("screenshot_deck", lambda *_: subprocess.Popen(["gnome-screenshot", "-i"])),
+            ("rename_pages", lambda *_: self._open_rename_dialog()),
             ("about", lambda *_: self._show_about()),
             ("quit", lambda *_: self.app.quit()),
         ]:
@@ -1064,6 +1166,16 @@ class MainWindow(Adw.ApplicationWindow):
         d.set_website("https://github.com/gorkaFM/diy-streamdeck")
         d.set_comments("Control panel para el ESP32-8048S043 Stream Deck en Linux.")
         d.present(self)
+
+    def _open_rename_dialog(self):
+        current = get_page_names()
+        d = RenamePagesDialog(self, current, self._apply_page_names)
+        d.present()
+
+    def _apply_page_names(self, names: list[str]):
+        set_page_names(names)
+        for p, page_obj in enumerate(self.page_view_objs):
+            page_obj.set_title(names[p])
 
 
 # ─── Tray icon ───
@@ -1353,7 +1465,7 @@ class Controller:
 # ─── Application ───
 class StreamDeckApp(Adw.Application):
     def __init__(self, minimized: bool):
-        super().__init__(application_id="com.bitsytornillos.streamdeck", flags=Gio.ApplicationFlags.FLAGS_NONE)
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
         self.minimized = minimized
         self.has_tray = HAS_TRAY
         self.controller: Controller | None = None
@@ -1425,11 +1537,17 @@ def run_daemon():
 
 
 # ─── Entry ───
+
 def main():
     parser = argparse.ArgumentParser(description="DIY Stream Deck Linux client")
     parser.add_argument("--minimized", action="store_true", help="Iniciar oculto en bandeja")
     parser.add_argument("--daemon", action="store_true", help="Modo sin GUI (solo handler de URL/apps)")
     args = parser.parse_args()
+
+    # Make the dock/taskbar show "Stream Deck" instead of "python3".
+    # GLib.set_prgname controls X11 WM_CLASS and GNOME's app match heuristic.
+    GLib.set_prgname(APP_ID)
+    GLib.set_application_name("Stream Deck")
 
     if args.daemon:
         run_daemon()

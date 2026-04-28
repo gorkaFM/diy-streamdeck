@@ -1,29 +1,74 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
   <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#667eea"/>
-      <stop offset="100%" stop-color="#764ba2"/>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"  stop-color="#7c8ff0"/>
+      <stop offset="60%" stop-color="#667eea"/>
+      <stop offset="100%" stop-color="#5a3f9c"/>
     </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.18"/>
+      <stop offset="60%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a1d2e"/>
+      <stop offset="100%" stop-color="#0e1020"/>
+    </linearGradient>
+    <radialGradient id="touch" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffe27a" stop-opacity="0.85"/>
+      <stop offset="60%" stop-color="#ffd34a" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#ffd34a" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
   </defs>
-  <rect x="2" y="6" width="60" height="52" rx="8" fill="url(#g)"/>
-  <g fill="#ffffff" fill-opacity="0.95">
-    <rect x="9"  y="13" width="11" height="9" rx="2"/>
-    <rect x="22" y="13" width="11" height="9" rx="2"/>
-    <rect x="35" y="13" width="11" height="9" rx="2"/>
-    <rect x="48" y="13" width="8"  height="9" rx="2"/>
-    <rect x="9"  y="25" width="11" height="9" rx="2"/>
-    <rect x="22" y="25" width="11" height="9" rx="2"/>
-    <rect x="35" y="25" width="11" height="9" rx="2"/>
-    <rect x="48" y="25" width="8"  height="9" rx="2"/>
-    <rect x="9"  y="37" width="11" height="9" rx="2"/>
-    <rect x="22" y="37" width="11" height="9" rx="2"/>
-    <rect x="35" y="37" width="11" height="9" rx="2"/>
-    <rect x="48" y="37" width="8"  height="9" rx="2"/>
+
+  <!-- Body / chassis -->
+  <rect x="6" y="14" width="116" height="100" rx="14" fill="url(#bg)"/>
+  <rect x="6" y="14" width="116" height="100" rx="14" fill="url(#glass)"/>
+
+  <!-- Screen bezel -->
+  <rect x="14" y="22" width="100" height="84" rx="8" fill="#0d0f1c"/>
+  <!-- Screen -->
+  <rect x="17" y="25" width="94" height="78" rx="6" fill="url(#screen)"/>
+
+  <!-- Sidebar (right side of the deck, ~12% of screen) -->
+  <rect x="99" y="29" width="9" height="70" rx="2" fill="#1d2238"/>
+  <circle cx="103.5" cy="34" r="1.6" fill="#4ade80"/>
+  <circle cx="103.5" cy="42" r="1.6" fill="#a8b1d6"/>
+  <circle cx="103.5" cy="50" r="1.6" fill="#a8b1d6"/>
+  <circle cx="103.5" cy="58" r="1.6" fill="#a8b1d6"/>
+  <circle cx="103.5" cy="66" r="1.6" fill="#a8b1d6"/>
+  <rect x="101" y="92" width="5" height="2" rx="1" fill="#fbbf24"/>
+
+  <!-- Button grid 4x3 -->
+  <g filter="url(#shadow)">
+    <!-- Row 1 -->
+    <rect x="22" y="30" width="17" height="20" rx="3" fill="#e74c3c"/>
+    <rect x="41" y="30" width="17" height="20" rx="3" fill="#27ae60"/>
+    <rect x="60" y="30" width="17" height="20" rx="3" fill="#3498db"/>
+    <rect x="79" y="30" width="17" height="20" rx="3" fill="#f1c40f"/>
+    <!-- Row 2 -->
+    <rect x="22" y="52" width="17" height="20" rx="3" fill="#9b59b6"/>
+    <rect x="41" y="52" width="17" height="20" rx="3" fill="#e67e22"/>
+    <rect x="60" y="52" width="17" height="20" rx="3" fill="#1abc9c"/>
+    <rect x="79" y="52" width="17" height="20" rx="3" fill="#ec407a"/>
+    <!-- Row 3 -->
+    <rect x="22" y="74" width="17" height="20" rx="3" fill="#34495e"/>
+    <rect x="41" y="74" width="17" height="20" rx="3" fill="#7f8c8d"/>
+    <rect x="60" y="74" width="17" height="20" rx="3" fill="#2ecc71"/>
+    <rect x="79" y="74" width="17" height="20" rx="3" fill="#2980b9"/>
   </g>
-  <g fill="#ffffff" fill-opacity="0.6">
-    <circle cx="24" cy="52" r="1.5"/>
-    <circle cx="32" cy="52" r="2.2"/>
-    <circle cx="40" cy="52" r="1.5"/>
+
+  <!-- Touch glow on the green button (Row 2 col 3) suggesting interaction -->
+  <circle cx="68.5" cy="62" r="14" fill="url(#touch)"/>
+  <circle cx="68.5" cy="62" r="3" fill="#fff" fill-opacity="0.65"/>
+
+  <!-- Page indicator dots (3 small at bottom of body) -->
+  <g>
+    <circle cx="58" cy="120" r="1.6" fill="#ffffff" fill-opacity="0.85"/>
+    <circle cx="64" cy="120" r="2.2" fill="#ffffff"/>
+    <circle cx="70" cy="120" r="1.6" fill="#ffffff" fill-opacity="0.55"/>
   </g>
 </svg>
