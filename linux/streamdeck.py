@@ -700,6 +700,13 @@ class StyleManager:
     .deck-card:hover {
         border-color: rgba(255,255,255,0.45);
     }
+    .deck-card.deck-dragging {
+        opacity: 0.4;
+    }
+    .deck-card.deck-drop-hover {
+        border-color: #ffd34a;
+        box-shadow: 0 0 0 3px rgba(255,211,74,0.6);
+    }
     .deck-card .deck-label {
         text-shadow: 0 1px 2px rgba(0,0,0,0.6);
         font-size: 13px;
@@ -749,11 +756,12 @@ class StyleManager:
 class DeckButton(Gtk.Button):
     __gtype_name__ = "DeckButton"
 
-    def __init__(self, page: int, idx: int, on_click, style_mgr: StyleManager):
+    def __init__(self, page: int, idx: int, on_click, on_swap, style_mgr: StyleManager):
         super().__init__()
         self.page = page
         self.idx = idx
         self._style = style_mgr
+        self._on_swap = on_swap
         self._color_class = f"deck-p{page}-i{idx}"
         self.add_css_class("deck-card")
         self.add_css_class(self._color_class)
@@ -779,7 +787,59 @@ class DeckButton(Gtk.Button):
         self.set_child(box)
 
         self.connect("clicked", lambda *_: on_click(page, idx))
+
+        # Drag source: export "page:idx" so the drop target knows what to swap.
+        drag_src = Gtk.DragSource()
+        drag_src.set_actions(Gdk.DragAction.MOVE)
+        drag_src.connect("prepare", self._on_drag_prepare)
+        drag_src.connect("drag-begin", self._on_drag_begin)
+        drag_src.connect("drag-end", self._on_drag_end)
+        self.add_controller(drag_src)
+
+        # Drop target: accept "page:idx" strings from another DeckButton.
+        drop_target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+        drop_target.connect("enter", self._on_drop_enter)
+        drop_target.connect("leave", self._on_drop_leave)
+        drop_target.connect("drop", self._on_drop)
+        self.add_controller(drop_target)
+
         self.update(default_button(idx))
+
+    def _on_drag_prepare(self, source, x, y):
+        v = GObject.Value(GObject.TYPE_STRING, f"{self.page}:{self.idx}")
+        return Gdk.ContentProvider.new_for_value(v)
+
+    def _on_drag_begin(self, source, drag):
+        try:
+            paintable = Gtk.WidgetPaintable.new(self)
+            source.set_icon(paintable, 40, 30)
+        except Exception:
+            pass
+        self.add_css_class("deck-dragging")
+
+    def _on_drag_end(self, source, drag, delete_data):
+        self.remove_css_class("deck-dragging")
+
+    def _on_drop_enter(self, target, x, y):
+        self.add_css_class("deck-drop-hover")
+        return Gdk.DragAction.MOVE
+
+    def _on_drop_leave(self, target):
+        self.remove_css_class("deck-drop-hover")
+
+    def _on_drop(self, target, value, x, y):
+        self.remove_css_class("deck-drop-hover")
+        if not isinstance(value, str):
+            return False
+        try:
+            sp_str, si_str = value.split(":", 1)
+            sp, si = int(sp_str), int(si_str)
+        except ValueError:
+            return False
+        if sp == self.page and si == self.idx:
+            return False  # dropped on itself
+        self._on_swap(sp, si, self.page, self.idx)
+        return True
 
     def update(self, data: ButtonData):
         self._style.set_color(self._color_class, data.r, data.g, data.b)
@@ -1229,7 +1289,7 @@ class MainWindow(Adw.ApplicationWindow):
             grid.set_vexpand(True)
             row_widgets = []
             for i in range(NUM_BUTTONS):
-                btn = DeckButton(p, i, self.ctrl.open_edit, self.style_mgr)
+                btn = DeckButton(p, i, self.ctrl.open_edit, self.ctrl.swap_buttons, self.style_mgr)
                 grid.attach(btn, i % COLS, i // COLS, 1, 1)
                 row_widgets.append(btn)
             self.buttons_widgets.append(row_widgets)
@@ -1348,6 +1408,60 @@ class Controller:
             return
         d = EditDialog(self.window, page, idx, self.pages[page][idx], self._on_edit_save, self._on_edit_clear)
         d.present()
+
+    def swap_buttons(self, p1: int, i1: int, p2: int, i2: int):
+        """Swap two buttons (data + icon cache + sync to deck)."""
+        if not (0 <= p1 < NUM_PAGES and 0 <= i1 < NUM_BUTTONS and 0 <= p2 < NUM_PAGES and 0 <= i2 < NUM_BUTTONS):
+            return
+        if p1 == p2 and i1 == i2:
+            return
+
+        a = self.pages[p1][i1]
+        b = self.pages[p2][i2]
+        self.pages[p1][i1] = b
+        self.pages[p2][i2] = a
+
+        # Swap on-disk icon caches so paths still match (page,idx)
+        cache1 = icon_cache_path(p1, i1)
+        cache2 = icon_cache_path(p2, i2)
+        tmp = ICON_CACHE / f".swap_{p1}_{i1}_{p2}_{i2}.tmp"
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        a_had = cache1.exists()
+        b_had = cache2.exists()
+        try:
+            if a_had:
+                cache1.rename(tmp)
+            if b_had:
+                cache2.rename(cache1)
+            if a_had:
+                tmp.rename(cache2)
+        except OSError as e:
+            print(f"[swap] icon cache rename failed: {e}", file=sys.stderr)
+
+        # Push both slots to the deck (visual + action)
+        for (p, i, btn) in [(p1, i1, b), (p2, i2, a)]:
+            btn.hasIcon = False  # will be re-set if we resend the icon below
+            self.serial.write(
+                f"SET:{p}:{i}:{btn.label}:{btn.r},{btn.g},{btn.b}:"
+                f"{btn.iconSizeIdx},{btn.borderStyle},{1 if btn.showLabel else 0}"
+            )
+            self.serial.write(f"ACT:{p}:{i}:{btn.actionType}:{btn.action}")
+
+        # Resend icons (or clear) to match the new occupants
+        for (p, i, btn) in [(p1, i1, b), (p2, i2, a)]:
+            ic = icon_cache_path(p, i)
+            if ic.exists():
+                self._send_icon(p, i, ic, btn)
+            else:
+                self.serial.write(f"NOICON:{p}:{i}")
+
+        if self.window:
+            self.window.update_button(p1, i1, b)
+            self.window.update_button(p2, i2, a)
 
     def set_device_page(self, page: int):
         if 0 <= page < NUM_PAGES and page != self.current_page:
