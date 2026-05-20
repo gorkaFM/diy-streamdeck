@@ -122,6 +122,28 @@ APP_PRESETS = [
     ("🌐 Wikipedia", "https://es.wikipedia.org"),
 ]
 
+def load_shell_presets() -> list[tuple[str, str]]:
+    """Read user-defined shell presets from a local-only config file.
+    File: $XDG_CONFIG_HOME/diy-streamdeck/shell_presets.json
+    Format: [{"label": "...", "command": "..."}] (or list of [label, command] pairs).
+    The file is intentionally not bundled with the app to keep personal commands
+    out of version control."""
+    path = CONFIG_DIR / "shell_presets.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[shell_presets] load failed: {e}", file=sys.stderr)
+        return []
+    out: list[tuple[str, str]] = []
+    for entry in data:
+        if isinstance(entry, dict) and "label" in entry and "command" in entry:
+            out.append((str(entry["label"]), str(entry["command"])))
+        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            out.append((str(entry[0]), str(entry[1])))
+    return out
+
 
 # ─── Data ───
 @dataclass
@@ -795,6 +817,19 @@ class StyleManager:
     }
     .status-on { background-color: #0d3320; color: #4ade80; }
     .status-off { background-color: #3b1111; color: #f87171; }
+    .dup-slot {
+        border-radius: 8px;
+        font-size: 12px;
+        padding: 4px 6px;
+    }
+    .dup-slot-empty {
+        background-color: rgba(74, 222, 128, 0.18);
+        border: 1px solid rgba(74, 222, 128, 0.45);
+    }
+    .dup-slot-occupied {
+        background-color: rgba(248, 113, 113, 0.18);
+        border: 1px solid rgba(248, 113, 113, 0.45);
+    }
     """
 
     def __init__(self):
@@ -961,12 +996,74 @@ class DeckButton(Gtk.Button):
             label = f"Mover a {page_names[tp]}"
             box.append(mk(label, lambda tp=tp: self._ctrl.move_to_page(self.page, self.idx, tp)))
 
+        for tp in range(NUM_PAGES):
+            if tp == self.page:
+                continue
+            label = f"Duplicar a {page_names[tp]}…"
+            box.append(mk(label, lambda tp=tp: self._open_duplicate_picker(tp)))
+
+        popover.set_child(box)
+        self._popover = popover
+        popover.popup()
+
+    def _open_duplicate_picker(self, target_page: int):
+        """Show a grid mirroring the deck layout so the user picks the
+        destination slot to duplicate into."""
+        if self._popover and self._popover.is_visible():
+            self._popover.popdown()
+
+        popover = Gtk.Popover()
+        popover.set_parent(self)
+        popover.set_has_arrow(False)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(8); box.set_margin_bottom(8)
+        box.set_margin_start(8); box.set_margin_end(8)
+
+        page_names = get_page_names()
+        title = Gtk.Label(label=f"Duplicar a slot de {page_names[target_page]}")
+        title.add_css_class("heading")
+        title.set_xalign(0.0)
+        box.append(title)
+
+        grid = Gtk.Grid()
+        grid.set_row_spacing(4)
+        grid.set_column_spacing(4)
+
+        for i in range(NUM_BUTTONS):
+            btn_data = self._ctrl.pages[target_page][i]
+            empty = self._ctrl.slot_is_empty(target_page, i)
+            label_text = (btn_data.label or "").strip()
+            if empty or not label_text or label_text == str(i + 1):
+                text = str(i + 1)
+            else:
+                short = label_text if len(label_text) <= 10 else label_text[:9] + "…"
+                text = f"{i + 1}  {short}"
+            slot_btn = Gtk.Button(label=text)
+            slot_btn.add_css_class("dup-slot")
+            slot_btn.add_css_class("dup-slot-empty" if empty else "dup-slot-occupied")
+            slot_btn.set_size_request(96, 48)
+            slot_btn.connect(
+                "clicked",
+                lambda _b, ti=target_page, si=i: (
+                    popover.popdown(),
+                    self._ctrl.duplicate_button(self.page, self.idx, ti, si),
+                ),
+            )
+            grid.attach(slot_btn, i % COLS, i // COLS, 1, 1)
+
+        box.append(grid)
         popover.set_child(box)
         self._popover = popover
         popover.popup()
 
     def update(self, data: ButtonData):
         self._style.set_color(self._color_class, data.r, data.g, data.b)
+        # Force GTK to recompute style cascade: load_from_string on the
+        # provider doesn't always invalidate widget styles immediately.
+        self.remove_css_class(self._color_class)
+        self.add_css_class(self._color_class)
+
         self.label_widget.set_label(data.label or str(self.idx + 1))
 
         # Hint = action preview
@@ -979,19 +1076,25 @@ class DeckButton(Gtk.Button):
             hint = "⌨ " + data.action[:25]
         elif data.actionType == 4 and data.action:
             hint = "✎ " + data.action[:25]
+        elif data.actionType == 5 and data.action:
+            hint = "$ " + data.action[:25]
         self.hint_widget.set_label(hint)
 
         # Icon: prefer cached image
         ic_path = icon_cache_path(self.page, self.idx)
+        showed_icon = False
         if ic_path.exists():
             try:
                 pb = GdkPixbuf.Pixbuf.new_from_file_at_size(str(ic_path), 40, 40)
                 self.icon_widget.set_from_pixbuf(pb)
                 self.icon_widget.set_visible(True)
-                return
+                showed_icon = True
             except GLib.Error:
                 pass
-        self.icon_widget.set_visible(False)
+        if not showed_icon:
+            self.icon_widget.clear()
+            self.icon_widget.set_visible(False)
+        self.queue_draw()
 
 
 # ─── Edit dialog ───
@@ -1243,6 +1346,24 @@ class EditDialog(Adw.Window):
                 btn.connect("clicked", lambda b, v=val, l=label: self._apply_preset(l, v))
                 flow.append(btn)
             self._presets_box.append(flow)
+        elif t == 5:
+            shell_presets = load_shell_presets()
+            if shell_presets:
+                self.presets_group.set_visible(True)
+                flow = Gtk.FlowBox()
+                flow.set_selection_mode(Gtk.SelectionMode.NONE)
+                flow.set_max_children_per_line(2)
+                flow.set_min_children_per_line(1)
+                flow.set_row_spacing(6)
+                flow.set_column_spacing(6)
+                flow.set_homogeneous(True)
+                for label, val in shell_presets:
+                    btn = Gtk.Button.new_with_label(label)
+                    btn.connect("clicked", lambda b, v=val, l=label: self._apply_preset(l, v))
+                    flow.append(btn)
+                self._presets_box.append(flow)
+            else:
+                self.presets_group.set_visible(False)
         else:
             self.presets_group.set_visible(False)
 
@@ -1775,6 +1896,60 @@ class Controller:
         """Swap this button with the same slot on the target page."""
         if 0 <= target_page < NUM_PAGES and target_page != page:
             self.swap_buttons(page, idx, target_page, idx)
+
+    def slot_is_empty(self, page: int, idx: int) -> bool:
+        """A slot counts as empty when it has no action and no cached icon."""
+        if not (0 <= page < NUM_PAGES and 0 <= idx < NUM_BUTTONS):
+            return False
+        if self.pages[page][idx].action:
+            return False
+        return not icon_cache_path(page, idx).exists()
+
+    def duplicate_button(self, src_page: int, src_idx: int, dst_page: int, dst_idx: int):
+        """Duplicate src to dst slot. If dst is occupied, fall back to the first
+        empty slot on the destination page. If the page is full, ask before
+        overwriting the slot the user picked."""
+        if not (0 <= src_page < NUM_PAGES and 0 <= src_idx < NUM_BUTTONS
+                and 0 <= dst_page < NUM_PAGES and 0 <= dst_idx < NUM_BUTTONS):
+            return
+        if src_page == dst_page and src_idx == dst_idx:
+            return
+
+        if self.slot_is_empty(dst_page, dst_idx):
+            self.copy_button(src_page, src_idx, dst_page, dst_idx)
+            return
+
+        for i in range(NUM_BUTTONS):
+            if self.slot_is_empty(dst_page, i):
+                self.copy_button(src_page, src_idx, dst_page, i)
+                if self.window:
+                    names = get_page_names()
+                    self.window.toast(
+                        f"Slot {dst_idx + 1} ocupado → duplicado al {i + 1} de {names[dst_page]}"
+                    )
+                return
+
+        self._confirm_overwrite_duplicate(src_page, src_idx, dst_page, dst_idx)
+
+    def _confirm_overwrite_duplicate(self, src_page, src_idx, dst_page, dst_idx):
+        if not self.window:
+            return
+        names = get_page_names()
+        confirm = Adw.AlertDialog.new(
+            f"¿Sobreescribir slot {dst_idx + 1} de {names[dst_page]}?",
+            f"{names[dst_page]} no tiene slots libres."
+        )
+        confirm.add_response("cancel", "Cancelar")
+        confirm.add_response("overwrite", "Sobreescribir")
+        confirm.set_response_appearance("overwrite", Adw.ResponseAppearance.DESTRUCTIVE)
+        confirm.set_default_response("cancel")
+
+        def on_resp(_d, response):
+            if response == "overwrite":
+                self.copy_button(src_page, src_idx, dst_page, dst_idx)
+
+        confirm.connect("response", on_resp)
+        confirm.present(self.window)
 
     def apply_profile(self, data: dict):
         """Replace the entire deck state from a parsed profile dict."""
